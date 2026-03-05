@@ -1,0 +1,9 @@
+{
+    "extension_api": 1,
+    "name": "Model Extractor",
+    "version": "2.1",
+    "minimum_renderdoc": "1.2",
+    "description": "Extract mesh data from draw calls in RenderDoc captures.\nExport to OBJ, PLY, glTF, CSV, FBX formats.\nCSV format can be converted to standard FBX via csv_to_fbx.py.\nSupports single draw call or batch export.",
+    "author": "ModelExtractor",
+    "url": ""
+}

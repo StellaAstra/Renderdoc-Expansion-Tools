@@ -8,9 +8,9 @@ RenderDoc 扩展安装脚本
   - model_extractor   (模型提取工具)
 
 使用方法:
-  python install_extension.py                  # 安装所有扩展
-  python install_extension.py --ext texture_exporter  # 仅安装贴图导出
-  python install_extension.py --ext model_extractor   # 仅安装模型提取
+  python install_extension.py                          # 安装所有扩展
+  python install_extension.py --ext texture_exporter   # 仅安装贴图导出
+  python install_extension.py --ext model_extractor    # 仅安装模型提取
 
 或指定自定义目录:
   python install_extension.py --target "C:\\path\\to\\extensions"
