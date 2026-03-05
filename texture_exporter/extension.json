@@ -1,0 +1,9 @@
+{
+    "extension_api": 1,
+    "name": "Texture Exporter",
+    "version": "1.0",
+    "minimum_renderdoc": "1.2",
+    "description": "Export all texture resources from the current capture to image files.\nSupports PNG, BMP, TGA, HDR, EXR, DDS formats.\nFilter by name, format, size, and more.",
+    "author": "TextureExporter",
+    "url": ""
+}
