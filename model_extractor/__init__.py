@@ -34,7 +34,7 @@ _config = {
     "export_normals": True,    # 导出法线
     "export_uvs": True,        # 导出 UV
     "export_colors": False,    # 导出顶点色
-    "flip_uv_v": True,         # 翻转 UV V 坐标 (DX -> OpenGL 约定)
+    "flip_uv_v": False,        # 翻转 UV V 坐标 (通常不需要；Unity/Blender 会自行处理)
     "swap_yz": False,          # 交换 Y/Z 轴
     "scale": 1.0,              # 缩放因子
     "merge_by_marker": False,  # 按 Marker 分组合并
@@ -164,13 +164,30 @@ def extract_mesh_from_draw(controller, action, config):
         print(f"  [WARN] EID {action.eventId}: No vertex inputs found")
         return None
 
+    # 打印 VBuffer 绑定信息
+    print(f"  [DEBUG] EID {action.eventId}: {len(vbs)} VBuffers bound:")
+    for vi_idx, vb in enumerate(vbs):
+        print(f"    VB[{vi_idx}] resource={vb.resourceId}, byteOffset={vb.byteOffset}, byteStride={vb.byteStride}")
+
+    # 打印 IBuffer 信息
+    print(f"  [DEBUG] IBuffer: resource={ib.resourceId}, byteOffset={ib.byteOffset}, byteStride={ib.byteStride}")
+
+    # 打印 DrawCall 参数
+    base_vertex = getattr(action, 'baseVertex', getattr(action, 'vertexOffset', 0))
+    print(f"  [DEBUG] DrawCall: numIndices={action.numIndices}, indexOffset={action.indexOffset}, "
+          f"baseVertex={base_vertex}, numInstances={action.numInstances}, "
+          f"flags={action.flags}")
+
     # 打印所有顶点属性信息，方便调试
-    print(f"  [DEBUG] EID {action.eventId}: Found {len(attrs)} vertex attributes:")
+    print(f"  [DEBUG] Found {len(attrs)} vertex attributes:")
     for i, attr in enumerate(attrs):
         fmt = attr.format
+        special = getattr(fmt, 'Special', getattr(fmt, 'special', None))
+        bgra = getattr(fmt, 'BGRAOrder', getattr(fmt, 'bgraOrder', False))
         print(f"    [{i}] name='{attr.name}', vbSlot={attr.vertexBuffer}, "
               f"offset={attr.byteOffset}, compCount={fmt.compCount}, "
               f"compType={fmt.compType}, compByteWidth={fmt.compByteWidth}, "
+              f"special={special}, bgra={bgra}, "
               f"perInstance={attr.perInstance}")
 
     # 识别各属性
@@ -289,8 +306,9 @@ def extract_mesh_from_draw(controller, action, config):
         print(f"    Color:    <not found>")
 
     # ---- 读取索引 ----
-    indices = []
+    raw_indices = []
     num_indices = action.numIndices
+    # base_vertex 已在上面的 DEBUG 输出中获取
 
     if ib.resourceId != rd.ResourceId.Null() and (action.flags & rd.ActionFlags.Indexed):
         try:
@@ -302,28 +320,60 @@ def extract_mesh_from_draw(controller, action, config):
                 if ib.byteStride == 2:
                     if off + 2 <= len(ib_data):
                         idx = struct.unpack_from('<H', ib_data, off)[0]
-                        indices.append(idx)
+                        raw_indices.append(idx)
                 elif ib.byteStride == 4:
                     if off + 4 <= len(ib_data):
                         idx = struct.unpack_from('<I', ib_data, off)[0]
-                        indices.append(idx)
+                        raw_indices.append(idx)
                 else:
                     if off + 1 <= len(ib_data):
                         idx = ib_data[off]
-                        indices.append(idx)
+                        raw_indices.append(idx)
         except Exception as e:
             print(f"  [WARN] Index buffer read error: {e}")
-            indices = list(range(num_indices))
-    else:
-        base_vertex = getattr(action, 'vertexOffset', 0)
-        indices = list(range(base_vertex, base_vertex + num_indices))
+            raw_indices = list(range(num_indices))
 
-    if not indices:
+        # 应用 baseVertex 偏移（DrawIndexed 的 BaseVertexLocation 参数）
+        # GPU 在使用索引时会自动加上 baseVertex，我们也需要这样做
+        if base_vertex != 0:
+            print(f"  [INFO] Applying baseVertex offset: {base_vertex}")
+            raw_indices = [idx + base_vertex for idx in raw_indices]
+    else:
+        raw_indices = list(range(base_vertex, base_vertex + num_indices))
+
+    if not raw_indices:
         return None
+
+    # ---- 重映射索引 ----
+    # raw_indices 中的值是顶点缓冲区中的绝对索引。
+    # 为了只导出 DrawCall 实际引用的顶点（而非整个缓冲区从 0 到 max_idx），
+    # 我们需要建立「旧索引 -> 新紧凑索引」的映射。
+    # 这样导出的顶点数就精确等于 DrawCall 使用的唯一顶点数。
+    unique_verts_ordered = []  # 按首次出现顺序排列的唯一顶点索引
+    old_to_new = {}           # 旧缓冲区索引 -> 新紧凑索引
+
+    for old_idx in raw_indices:
+        if old_idx not in old_to_new:
+            old_to_new[old_idx] = len(unique_verts_ordered)
+            unique_verts_ordered.append(old_idx)
+
+    # indices 现在是重映射后的紧凑索引（0-based, 连续）
+    indices = [old_to_new[idx] for idx in raw_indices]
+
+    print(f"  [INFO] Index remap: {len(raw_indices)} indices, "
+          f"{len(unique_verts_ordered)} unique vertices "
+          f"(buffer range: {min(unique_verts_ordered)}-{max(unique_verts_ordered)})")
 
     # ---- 读取顶点属性 ----
     def read_vertex_attr(attr, num_components=None):
-        """读取顶点属性数据，返回 tuples 列表"""
+        """
+        按 unique_verts_ordered 中记录的缓冲区索引精确读取顶点属性数据。
+        返回的列表按 unique_verts_ordered 的顺序排列，与重映射后的 indices 一一对应。
+
+        读取策略：
+        - 始终按属性原始的 compCount 分量来读取（避免跨步对齐问题）
+        - 如果调用方请求的 num_components 与原始不同，在读取后截取/填充
+        """
         vb_idx = attr.vertexBuffer
         if vb_idx >= len(vbs):
             print(f"    [WARN] Attr '{attr.name}': vb_idx {vb_idx} >= num VBs {len(vbs)}")
@@ -341,16 +391,84 @@ def extract_mesh_from_draw(controller, action, config):
             return []
 
         fmt = attr.format
-        comp_count = num_components or fmt.compCount
+        # 始终按原始分量数读取，避免对齐问题
+        raw_comp_count = fmt.compCount
+        wanted_comp = num_components or raw_comp_count
         stride = vb_info.byteStride
 
         if stride == 0:
             print(f"    [WARN] Attr '{attr.name}': stride is 0")
             return []
 
-        max_idx = max(indices) if indices else 0
         results = []
 
+        # ---------- 检测 R10G10B10A2 特殊格式 ----------
+        # R10G10B10A2 是 4 分量但只占 4 字节（整个打包在一个 uint32 中）
+        # 判断方法：compCount=4 且总字节 = 4（即 compByteWidth * compCount != 实际大小）
+        # 或者通过 Special 标志（RenderDoc 某些版本会标记）
+        is_r10g10b10a2 = False
+        special = getattr(fmt, 'Special', getattr(fmt, 'special', None))
+
+        # 检测方式1：Special 枚举值（R10G10B10A2 在 RenderDoc 中的 special 值）
+        if special is not None and special != 0:
+            # rd.SpecialFormat.R10G10B10A2 的枚举值
+            try:
+                if special == rd.SpecialFormat.R10G10B10A2:
+                    is_r10g10b10a2 = True
+            except Exception:
+                pass
+
+        # 检测方式2：启发式 — 4分量但每分量只标记1字节（实际是打包格式）
+        # R10G10B10A2: compCount=4, compByteWidth=4（整个32位）或 compByteWidth=1（每分量标记）
+        # 但 compByteWidth=4 + compCount=4 会被误认为 4x uint32
+        # 更可靠的检测：4 分量 + 属性总大小刚好 4 字节
+        if not is_r10g10b10a2 and raw_comp_count == 4:
+            # 计算属性实际占用的字节数
+            attr_total_bytes = fmt.compByteWidth * raw_comp_count
+            # 如果声称 4 分量但总大小不合理（4字节 = R10G10B10A2，而非 4x float = 16字节）
+            # 这种情况 compByteWidth 可能被报告为 0 或 1
+            if fmt.compByteWidth == 0:
+                is_r10g10b10a2 = True
+
+        if is_r10g10b10a2:
+            print(f"    [INFO] Attr '{attr.name}': Detected R10G10B10A2 format")
+            is_signed = fmt.compType in (rd.CompType.SNorm, rd.CompType.SInt)
+            elem_size = 4  # 整个打包在 4 字节
+
+            for vi in unique_verts_ordered:
+                offset = vb_info.byteOffset + attr.byteOffset + vi * stride
+                if offset + elem_size > len(buf_data):
+                    results.append(tuple([0.0] * wanted_comp))
+                    continue
+                try:
+                    packed = struct.unpack_from('<I', buf_data, offset)[0]
+                    # 解包 10+10+10+2 位
+                    r = (packed >> 0) & 0x3FF    # 10 bits
+                    g = (packed >> 10) & 0x3FF   # 10 bits
+                    b = (packed >> 20) & 0x3FF   # 10 bits
+                    a = (packed >> 30) & 0x3      # 2 bits
+
+                    if is_signed:
+                        # SNorm: 10 bit signed -> [-1, 1]
+                        if r >= 512: r -= 1024
+                        if g >= 512: g -= 1024
+                        if b >= 512: b -= 1024
+                        if a >= 2: a -= 4
+                        vals = (r / 511.0, g / 511.0, b / 511.0, a / 1.0)
+                    else:
+                        # UNorm: [0, 1]
+                        vals = (r / 1023.0, g / 1023.0, b / 1023.0, a / 3.0)
+
+                    # 截取到需要的分量数
+                    vals = vals[:wanted_comp]
+                    if len(vals) < wanted_comp:
+                        vals = vals + (0.0,) * (wanted_comp - len(vals))
+                    results.append(vals)
+                except Exception:
+                    results.append(tuple([0.0] * wanted_comp))
+            return results
+
+        # ---------- 标准格式处理 ----------
         comp_map = {
             (rd.CompType.Float, 2): ('e', 2),    # float16
             (rd.CompType.Float, 4): ('f', 4),    # float32
@@ -373,26 +491,26 @@ def extract_mesh_from_draw(controller, action, config):
         if key not in comp_map:
             print(f"    [WARN] Attr '{attr.name}': unsupported format compType={fmt.compType}, "
                   f"compByteWidth={fmt.compByteWidth} — trying float32 fallback")
-            # 尝试按 float32 回退
             if fmt.compByteWidth == 2:
-                # 可能是 float16 (half)
                 char, size = 'e', 2
             else:
                 return []
         else:
             char, size = comp_map[key]
-        unpack_fmt = f'<{comp_count}{char}'
-        elem_size = comp_count * size
+
+        # 按原始分量数读取，避免跨步问题
+        unpack_fmt = f'<{raw_comp_count}{char}'
+        elem_size = raw_comp_count * size
 
         is_unorm = fmt.compType == rd.CompType.UNorm
         is_snorm = fmt.compType == rd.CompType.SNorm
         unorm_max = float((2 ** (fmt.compByteWidth * 8)) - 1) if is_unorm else 1.0
         snorm_max = float(2 ** (fmt.compByteWidth * 8 - 1) - 1) if is_snorm else 1.0
 
-        for vi in range(max_idx + 1):
+        for vi in unique_verts_ordered:
             offset = vb_info.byteOffset + attr.byteOffset + vi * stride
             if offset + elem_size > len(buf_data):
-                results.append(tuple([0.0] * comp_count))
+                results.append(tuple([0.0] * wanted_comp))
                 continue
 
             try:
@@ -403,6 +521,13 @@ def extract_mesh_from_draw(controller, action, config):
                     vals = tuple(max(-1.0, v / snorm_max) for v in raw)
                 else:
                     vals = tuple(float(v) for v in raw)
+
+                # 截取或填充到需要的分量数
+                if len(vals) > wanted_comp:
+                    vals = vals[:wanted_comp]
+                elif len(vals) < wanted_comp:
+                    vals = vals + (0.0,) * (wanted_comp - len(vals))
+
                 # 清理 NaN / Inf / 异常大值
                 cleaned = []
                 for v in vals:
@@ -412,7 +537,7 @@ def extract_mesh_from_draw(controller, action, config):
                         cleaned.append(v)
                 results.append(tuple(cleaned))
             except Exception:
-                results.append(tuple([0.0] * comp_count))
+                results.append(tuple([0.0] * wanted_comp))
 
         return results
 
@@ -438,6 +563,8 @@ def extract_mesh_from_draw(controller, action, config):
     for p in raw_positions:
         x, y, z = p[0], p[1], p[2]
         x, y, z = x * scale, y * scale, z * scale
+        # Negate X for DX left-hand → right-hand coordinate system
+        x = -x
         if swap_yz:
             y, z = z, y
         positions.append((x, y, z))
@@ -446,11 +573,43 @@ def extract_mesh_from_draw(controller, action, config):
     normals = []
     if normal_attr:
         raw_normals = read_vertex_attr(normal_attr, 3)
-        for n in raw_normals:
-            nx, ny, nz = n[0], n[1], n[2]
-            if swap_yz:
-                ny, nz = nz, ny
-            normals.append((nx, ny, nz))
+
+        # 首先检测压缩编码（必须在归一化之前！归一化后所有值都在 [-1,1]，无法检测）
+        # 许多游戏在 NORMAL 语义中存储压缩编码数据（如 packed tangent frame），
+        # 顶点着色器内部用位操作解码。这种情况下原始 float 值会是非常大的整数值
+        # 或者完全超出 [-1, 1] 范围。直接使用会导致 Unity 中光影完全错误。
+        is_packed = False
+        if raw_normals:
+            raw_max_abs = max(max(abs(n[0]), abs(n[1]), abs(n[2])) for n in raw_normals)
+            print(f"  [DEBUG] Raw normal range: max |value| = {raw_max_abs:.4f}")
+            if raw_max_abs > 1.5:
+                is_packed = True
+                print(f"  [WARN] Normal data appears to be packed/encoded (max |value| = {raw_max_abs:.1f}).")
+                print(f"         This game likely uses compressed tangent frames decoded in the vertex shader.")
+                print(f"         Discarding invalid normals — the importing tool (Unity/Blender) will recalculate them.")
+
+        if not is_packed and raw_normals:
+            for n in raw_normals:
+                nx, ny, nz = n[0], n[1], n[2]
+                # 归一化法线向量（压缩格式解码后可能不是精确单位长度）
+                length = math.sqrt(nx * nx + ny * ny + nz * nz)
+                if length > 1e-8:
+                    nx, ny, nz = nx / length, ny / length, nz / length
+                else:
+                    nx, ny, nz = 0.0, 0.0, 1.0  # 退化法线用默认值
+                # 注意：法线不需要取负 X——缠绕方向反转已经处理了面法线方向，
+                # 顶点法线保持原始方向即可（与 MCP Bridge 验证一致的行为）
+                if swap_yz:
+                    ny, nz = nz, ny
+                normals.append((nx, ny, nz))
+
+            # 打印归一化后的法线范围
+            if normals:
+                nxs = [n[0] for n in normals]
+                nys = [n[1] for n in normals]
+                nzs = [n[2] for n in normals]
+                print(f"  [DEBUG] Normal range (normalized): X=[{min(nxs):.4f}, {max(nxs):.4f}], "
+                      f"Y=[{min(nys):.4f}, {max(nys):.4f}], Z=[{min(nzs):.4f}, {max(nzs):.4f}]")
 
     # 读取 UV（支持多套，包括从高分量属性中拆分）
     uv_sets = []
@@ -567,14 +726,14 @@ def export_obj(mesh_data, filepath):
                 for uv in uv_channel:
                     f.write(f"# vt{ui} {uv[0]:.6f} {uv[1]:.6f}\n")
 
-        # 面（OBJ 是 1-based）
+        # 面（OBJ 是 1-based, 交换 v1/v2 反转缠绕方向配合 X 轴翻转）
         f.write(f"\n")
         has_uvs = len(uvs) > 0
         has_normals = len(normals) > 0
 
         for i in range(0, len(indices) - 2, 3):
             i0, i1, i2 = indices[i], indices[i + 1], indices[i + 2]
-            v0, v1, v2 = i0 + 1, i1 + 1, i2 + 1
+            v0, v1, v2 = i0 + 1, i2 + 1, i1 + 1  # swap v1/v2
 
             if has_uvs and has_normals:
                 f.write(f"f {v0}/{v0}/{v0} {v1}/{v1}/{v1} {v2}/{v2}/{v2}\n")
@@ -663,10 +822,10 @@ def export_ply(mesh_data, filepath):
                 a = int(max(0, min(255, c[3] * 255))) if len(c) > 3 else 255
                 f.write(struct.pack('<BBBB', r, g, b, a))
 
-        # 面数据
+        # 面数据（交换 v1/v2 反转缠绕方向，配合 X 轴翻转）
         for i in range(0, len(indices) - 2, 3):
             f.write(struct.pack('<B', 3))
-            f.write(struct.pack('<III', indices[i], indices[i + 1], indices[i + 2]))
+            f.write(struct.pack('<III', indices[i], indices[i + 2], indices[i + 1]))
 
     return True
 
@@ -694,10 +853,12 @@ def export_gltf(mesh_data, filepath):
     # 构建二进制缓冲区
     bin_data = bytearray()
 
-    # 索引数据（UNSIGNED_INT）
+    # 索引数据（UNSIGNED_INT）— 交换 v1/v2 反转缠绕方向，配合 X 轴翻转
     idx_offset = len(bin_data)
-    for idx in indices:
-        bin_data += struct.pack('<I', idx)
+    for fi in range(0, len(indices) - 2, 3):
+        bin_data += struct.pack('<I', indices[fi])
+        bin_data += struct.pack('<I', indices[fi + 2])  # swap i1/i2
+        bin_data += struct.pack('<I', indices[fi + 1])
     idx_length = len(bin_data) - idx_offset
 
     # 对齐到 4 字节
@@ -920,11 +1081,11 @@ def export_csv(mesh_data, filepath):
                         f"{colors[i][2]:.6f}", f"{colors[i][3]:.6f}" if len(colors[i]) > 3 else "1.000000"]
             f.write(",".join(row) + "\n")
 
-    # -- 索引 CSV --
+    # -- 索引 CSV --（交换 v1/v2 反转缠绕方向，配合 X 轴翻转）
     with open(idx_path, 'w', encoding='utf-8') as f:
         f.write("i0,i1,i2\n")
         for fi in range(0, len(indices) - 2, 3):
-            f.write(f"{indices[fi]},{indices[fi+1]},{indices[fi+2]}\n")
+            f.write(f"{indices[fi]},{indices[fi+2]},{indices[fi+1]}\n")
 
     # -- 元数据 JSON（供 csv_to_fbx.py 使用）--
     meta_path = base + "_meta.json"
@@ -1029,7 +1190,7 @@ def export_fbx(mesh_data, filepath):
     fbx_indices = []
     for fi in range(num_faces):
         i0, i1, i2 = indices[fi * 3], indices[fi * 3 + 1], indices[fi * 3 + 2]
-        fbx_indices.extend([i0, i1, -(i2 + 1)])
+        fbx_indices.extend([i0, i2, -(i1 + 1)])  # swap i1/i2 for winding reversal
 
     # 生成边列表
     edges = _generate_edges(indices, num_faces)
@@ -1054,12 +1215,16 @@ def export_fbx(mesh_data, filepath):
     edges_str = fmt_int_arr(edges)
 
     # 法线（ByPolygonVertex / Direct）— 不带 NormalsW
+    # 注意：法线展开顺序必须与 PolygonVertexIndex 的缠绕反转一致（i0, i2, i1）
     normals_section = ""
     if has_normals:
         face_normals = []
         for fi in range(num_faces):
-            for j in range(3):
-                idx = indices[fi * 3 + j]
+            i0 = indices[fi * 3]
+            i1 = indices[fi * 3 + 1]
+            i2 = indices[fi * 3 + 2]
+            # 按反转后的缠绕顺序展开：i0, i2, i1
+            for idx in [i0, i2, i1]:
                 if idx < len(normals):
                     face_normals.extend(safe_float(v) for v in normals[idx])
                 else:
@@ -1077,11 +1242,14 @@ def export_fbx(mesh_data, filepath):
 \t\t}}"""
 
     # UV（ByPolygonVertex / IndexToDirect）— 支持多套 UV
+    # UV indices 顺序必须与 PolygonVertexIndex 的缠绕反转一致（i0, i2, i1）
     uv_section = ""
     uv_indices = []
     for fi in range(num_faces):
-        for j in range(3):
-            uv_indices.append(indices[fi * 3 + j])
+        i0 = indices[fi * 3]
+        i1 = indices[fi * 3 + 1]
+        i2 = indices[fi * 3 + 2]
+        uv_indices.extend([i0, i2, i1])  # 按反转缠绕顺序
     uv_idx_str = fmt_int_arr(uv_indices)
 
     for ui, uv_channel in enumerate(valid_uv_sets):
