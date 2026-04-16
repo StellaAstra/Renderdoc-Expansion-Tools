@@ -18,6 +18,7 @@
   - [3.4 贴图保存与格式处理](#34-贴图保存与格式处理)
   - [3.5 特殊贴图类型处理](#35-特殊贴图类型处理)
   - [3.6 UI 面板与停靠窗口](#36-ui-面板与停靠窗口)
+  - [3.7 贴图后处理（v2.0 新增）](#37-贴图后处理v20-新增)
 - [四、Model Extractor 原理解析](#四model-extractor-原理解析)
   - [4.1 整体架构](#41-整体架构)
   - [4.2 GPU 管线数据提取原理](#42-gpu-管线数据提取原理)
@@ -381,6 +382,77 @@ def _on_open_panel(ctx, data):
 | `CreateTextBox(sl,cb)`        | 文本输入框  |
 | `CreateVerticalContainer()`   | 垂直布局容器 |
 | `CreateHorizontalContainer()` | 水平布局容器 |
+
+### 3.7 贴图后处理（v2.0 新增）
+
+**v2.0 核心改进。** RenderDoc 的 `SaveTexture()` API 有两个已知问题：
+
+1. **Y 轴翻转**：DX11 纹理以左上角为原点（top-down 存储），直接保存后图片上下颠倒
+2. **sRGB gamma 错误**：解压 BC7_SRGB 等压缩格式时，GPU 执行 sRGB→Linear 解码，但 `SaveTexture` 将 Linear 值直接写入 PNG，导致颜色严重偏暗
+
+**精确验证**（通过 RenderDoc MCP 的像素级对比确认）：
+
+```
+对于参考贴图的每个像素 ref_srgb：
+  ref_linear = sRGB_to_Linear(ref_srgb)
+  |exported - ref_linear| = 0.3   ← 几乎完全吻合！
+  |exported - ref_srgb|   = 48.5  ← 差距巨大
+
+结论：exported ≈ sRGB_to_Linear(correct)
+```
+
+**技术挑战**：RenderDoc 内置 Python 3.6 环境**没有 Pillow 和 numpy**，必须用纯 Python + struct + zlib 实现 PNG 像素级操作。
+
+**实现方案 — `_post_process_texture_file()`**：
+
+```
+PNG 文件
+  ↓ 读取并解析 IHDR（宽高、色彩类型、位深度）
+  ↓ 收集所有 IDAT chunk 数据
+  ↓ zlib.decompress() 解压
+  ↓ PNG Filter 反解码（还原真实像素值）
+  ↓ Linear→sRGB gamma 校正（查找表，仅 RGB，Alpha 不动）
+  ↓ Y 轴翻转（rows.reverse()）
+  ↓ 用 filter=0 (None) 重编码所有行
+  ↓ zlib.compress() 压缩
+  ↓ 重建 PNG 文件（重算 CRC）
+  ↓ 写回文件
+```
+
+**PNG Filter 反解码**是关键难点。PNG 的每行像素数据都经过 filter 编码（5 种类型），存储的不是原始像素值而是差分值：
+
+| Filter Type | 名称 | 编码规则 |
+|:-----------:|------|---------|
+| 0 | None | 无变换，直接存储 |
+| 1 | Sub | `filtered[i] = raw[i] - raw[i-bpp]` |
+| 2 | Up | `filtered[i] = raw[i] - prior[i]` |
+| 3 | Average | `filtered[i] = raw[i] - floor((raw[i-bpp] + prior[i]) / 2)` |
+| 4 | Paeth | `filtered[i] = raw[i] - PaethPredictor(a, b, c)` |
+
+反解码就是上述过程的逆运算。必须**逐行按顺序**处理（后一行的 Up/Average/Paeth 依赖前一行的解码结果）。
+
+**踩坑经历**：第一版实现直接修改 filter 后的字节然后写回，导致图片出现蓝紫色条纹噪点——因为修改了差分值但没更新 filter 编码。修复后改为：先完整反 filter 解码得到真实像素 → 修改像素 → 用 filter=0 重编码（最简单可靠）。
+
+**Linear→sRGB 转换**使用 256 元素预计算查找表，避免逐像素做浮点幂运算（2048² RGBA = 1600 万次查表 vs 幂运算，性能差距 10 倍+）：
+
+```python
+def _linear_to_srgb_byte(v):
+    c = v / 255.0
+    if c <= 0.0031308:
+        s = c * 12.92
+    else:
+        s = 1.055 * (c ** (1.0 / 2.4)) - 0.055
+    return max(0, min(255, int(s * 255.0 + 0.5)))
+
+_LIN2SRGB_LUT = [_linear_to_srgb_byte(i) for i in range(256)]
+```
+
+**格式限制**：
+- PNG（8-bit RGB/RGBA）：完整支持纯 Python 后处理
+- BMP/TGA：尝试 PIL fallback（如果环境中有的话）
+- DDS/HDR/EXR：不做后处理（它们有自己的色彩空间管理）
+
+**修复效果**：导出贴图与 UE 原始资源逐像素对比，全局平均误差 **0.87/255**（±1 量化误差），像素级匹配。
 
 ---
 
@@ -1200,6 +1272,9 @@ for item in ro_resources:
 | 法线数据为压缩编码（v2.1 新增）    | 检测 max\|value\| > 1.5 后自动丢弃，让导入工具重算 |
 | R10G10B10A2 格式（v2.1 新增）| 自动检测并正确解包 10+10+10+2 位         |
 | 属性分量数不足（v2.1 新增）      | 用 0.0 填充到请求的分量数                |
+| SaveTexture 导出颜色偏暗（v2.0 新增）| PNG 后处理：Linear→sRGB gamma 校正（查找表实现） |
+| SaveTexture 导出上下颠倒（v2.0 新增）| PNG 后处理：Y 轴翻转（PNG filter 反解码后翻转行序）  |
+| PNG filter 编码破坏像素数据（v2.0 新增）| 完整实现 5 种 filter 类型的反解码，修改后用 filter=0 重编码 |
 
 ### 调试信息输出
 
@@ -1214,7 +1289,7 @@ for item in ro_resources:
 
 ---
 
-*本文档基于 Texture Exporter v1.3 和 Model Extractor v2.1 的源代码编写。*
+*本文档基于 Texture Exporter v2.0 和 Model Extractor v2.1 的源代码编写。*
 
 ---
 

@@ -114,6 +114,203 @@ def get_slice_count(tex, config):
 
 
 # ============================================================
+# 贴图后处理（Y翻转 + Linear→sRGB gamma 校正）
+# ============================================================
+#
+# RenderDoc SaveTexture 的两个已知问题：
+# 1. DX11 纹理以 top-down 方向存储，导出的 PNG 上下颠倒
+# 2. sRGB 格式贴图（BC7_SRGB 等）被解码为 Linear 值，颜色偏暗
+#
+# 此函数用纯 Python + struct + zlib 实现，不依赖 PIL/numpy
+# （因为 RenderDoc 内置 Python 3.6 环境没有这些包）
+
+import struct as _struct
+import zlib as _zlib
+import math as _math
+
+
+def _linear_to_srgb_byte(v):
+    """将一个 0-255 的 Linear 值转换为 sRGB 值（返回 0-255 整数）"""
+    c = v / 255.0
+    if c <= 0.0031308:
+        s = c * 12.92
+    else:
+        s = 1.055 * (c ** (1.0 / 2.4)) - 0.055
+    return max(0, min(255, int(s * 255.0 + 0.5)))
+
+
+# 预计算 Linear→sRGB 查找表（256 个值，只算一次）
+_LIN2SRGB_LUT = [_linear_to_srgb_byte(i) for i in range(256)]
+
+
+def _post_process_texture_file(filepath, apply_flip=True, apply_gamma=True):
+    """
+    对 SaveTexture 导出的 PNG 文件做后处理：
+    1. Y 轴翻转（DX top-down → 标准图片方向）
+    2. Linear→sRGB gamma 校正（仅 RGB 通道，Alpha 不动）
+
+    纯 Python 实现，不依赖 PIL/numpy。仅处理 PNG 格式。
+    对 DDS/HDR/EXR 等格式不调用此函数。
+    """
+    if not filepath.lower().endswith('.png'):
+        # 对非 PNG 格式（BMP/TGA），尝试用 PIL（如果有的话）
+        try:
+            from PIL import Image
+            img = Image.open(filepath)
+            import numpy as np
+            arr = np.array(img).astype(np.float64)
+            if apply_flip:
+                arr = arr[::-1].copy()
+            if apply_gamma and arr.shape[2] >= 3:
+                rgb = arr[:, :, :3] / 255.0
+                srgb = np.where(
+                    rgb <= 0.0031308, rgb * 12.92,
+                    1.055 * np.power(np.clip(rgb, 0.0031308, 1.0), 1.0 / 2.4) - 0.055)
+                arr[:, :, :3] = np.clip(srgb * 255.0, 0, 255)
+            Image.fromarray(arr.astype(np.uint8), mode=img.mode).save(filepath)
+            return True
+        except ImportError:
+            return False
+        except Exception:
+            return False
+
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        if data[:8] != b'\x89PNG\r\n\x1a\n':
+            return False
+
+        # Parse IHDR
+        ihdr_len = _struct.unpack('>I', data[8:12])[0]
+        if data[12:16] != b'IHDR':
+            return False
+        ihdr_data = data[16:16 + ihdr_len]
+        width = _struct.unpack('>I', ihdr_data[0:4])[0]
+        height = _struct.unpack('>I', ihdr_data[4:8])[0]
+        bit_depth = ihdr_data[8]
+        color_type = ihdr_data[9]
+
+        if bit_depth != 8 or color_type not in (2, 6):
+            return False
+
+        channels = 4 if color_type == 6 else 3
+        bpp = channels  # bytes per pixel (8-bit)
+        row_bytes = width * channels
+        stride = 1 + row_bytes  # filter byte + pixel data
+
+        # Collect IDAT and other chunks
+        idat_data = b''
+        pos = 8
+        chunks = []
+        while pos < len(data):
+            clen = _struct.unpack('>I', data[pos:pos + 4])[0]
+            ctype = data[pos + 4:pos + 8]
+            cdata = data[pos + 8:pos + 8 + clen]
+            if ctype == b'IDAT':
+                idat_data += cdata
+            chunks.append((ctype, cdata))
+            pos += 12 + clen
+
+        raw = _zlib.decompress(idat_data)
+        if len(raw) != height * stride:
+            return False
+
+        # ============================================================
+        # PNG Filter 反解码：还原出真实像素值
+        # Filter types: 0=None, 1=Sub, 2=Up, 3=Average, 4=Paeth
+        # ============================================================
+        decoded_rows = []  # list of bytearray, each row_bytes long (no filter byte)
+        prev_row = bytearray(row_bytes)  # previous row (all zeros for first row)
+
+        for y in range(height):
+            row_start = y * stride
+            ftype = raw[row_start]
+            scanline = bytearray(raw[row_start + 1:row_start + stride])
+
+            if ftype == 0:  # None
+                pass
+            elif ftype == 1:  # Sub
+                for i in range(bpp, row_bytes):
+                    scanline[i] = (scanline[i] + scanline[i - bpp]) & 0xFF
+            elif ftype == 2:  # Up
+                for i in range(row_bytes):
+                    scanline[i] = (scanline[i] + prev_row[i]) & 0xFF
+            elif ftype == 3:  # Average
+                for i in range(row_bytes):
+                    left = scanline[i - bpp] if i >= bpp else 0
+                    scanline[i] = (scanline[i] + ((left + prev_row[i]) >> 1)) & 0xFF
+            elif ftype == 4:  # Paeth
+                for i in range(row_bytes):
+                    a = scanline[i - bpp] if i >= bpp else 0
+                    b = prev_row[i]
+                    c = prev_row[i - bpp] if i >= bpp else 0
+                    p = a + b - c
+                    pa = abs(p - a)
+                    pb = abs(p - b)
+                    pc = abs(p - c)
+                    if pa <= pb and pa <= pc:
+                        pr = a
+                    elif pb <= pc:
+                        pr = b
+                    else:
+                        pr = c
+                    scanline[i] = (scanline[i] + pr) & 0xFF
+
+            decoded_rows.append(scanline)
+            prev_row = scanline
+
+        # ============================================================
+        # 应用 gamma 校正（Linear → sRGB，仅 RGB，Alpha 不动）
+        # ============================================================
+        if apply_gamma:
+            lut = _LIN2SRGB_LUT
+            for row in decoded_rows:
+                for x in range(width):
+                    base = x * channels
+                    row[base] = lut[row[base]]          # R
+                    row[base + 1] = lut[row[base + 1]]  # G
+                    row[base + 2] = lut[row[base + 2]]  # B
+                    # Alpha (base+3) untouched
+
+        # ============================================================
+        # Y 翻转
+        # ============================================================
+        if apply_flip:
+            decoded_rows.reverse()
+
+        # ============================================================
+        # 重建 PNG（所有行用 filter=0 None，最简单可靠）
+        # ============================================================
+        new_raw = b''
+        for row in decoded_rows:
+            new_raw += b'\x00' + bytes(row)
+
+        new_idat = _zlib.compress(new_raw, 6)
+
+        out = b'\x89PNG\r\n\x1a\n'
+        first_idat = True
+        for ctype, cdata in chunks:
+            if ctype == b'IDAT':
+                if first_idat:
+                    cdata = new_idat
+                    first_idat = False
+                else:
+                    continue
+            chunk_bytes = ctype + cdata
+            crc = _zlib.crc32(chunk_bytes) & 0xFFFFFFFF
+            out += _struct.pack('>I', len(cdata)) + chunk_bytes + _struct.pack('>I', crc)
+
+        with open(filepath, 'wb') as f:
+            f.write(out)
+        return True
+
+    except Exception as e:
+        print("  [PostProcess] Error: %s" % str(e))
+        return False
+
+
+# ============================================================
 # 核心导出逻辑
 # ============================================================
 
@@ -250,6 +447,10 @@ def do_export_textures(controller, config, target_ids=None):
                     save.destType = cur_file_type
 
                     controller.SaveTexture(save, filepath)
+
+                    # Post-process: Y-flip + Linear→sRGB (skip DDS/HDR/EXR)
+                    if cur_file_ext not in ("dds", "hdr", "exr"):
+                        _post_process_texture_file(filepath)
 
                     size_str = ""
                     if os.path.exists(filepath):
@@ -1037,7 +1238,7 @@ def register(version, ctx):
     global _ctx
     _ctx = ctx
 
-    print("[Texture Exporter] Extension loaded (v1.3)")
+    print("[Texture Exporter] Extension loaded (v2.0 — Y-flip + sRGB gamma correction)")
 
     # 注册到 Tools 菜单 — 打开快捷面板
     ctx.Extensions().RegisterWindowMenu(
@@ -1120,6 +1321,11 @@ def _on_context_export_texture(ctx, data):
                 save.destType = file_type
 
                 controller.SaveTexture(save, out_path)
+
+                # Post-process: Y-flip + Linear→sRGB (skip DDS/HDR/EXR)
+                if file_ext not in ("dds", "hdr", "exr"):
+                    _post_process_texture_file(out_path)
+
                 print(f"[Texture Exporter] Texture saved to: {out_path}")
             except Exception as e:
                 print(f"[Texture Exporter] ERROR saving texture: {e}")
